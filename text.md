@@ -1,8 +1,10 @@
 # Метод барона Мюнхгаузена, или как быстро вызвать функцию, о которой (почти) ничего не знаешь
 
-Эта история началась очень издалека. В один прекрасный день я приобрёл себе Lego Mindstorms, очень скоро разочаровался в его среде разработки и задался целью написать для него фреймворк для разработки на C#. Вдохновившись моделью контроллера ASP.NET, я начал сооружать нечто подобное: логика робота описывается одним классом, свойства (properties) которого – это показания сенсоров, а методы – шаги одной итерации event loop'а робота, получающие в качестве аргументов значения свойств. Для реализации этого нужно научиться вызывать методы произвольной сигнатуры в рантайме, а с учётом того, что работает это всё на дохленьком ARM9 – это нужно делать *быстро*. К каким изысканиям это привело – читайте в этой статье.
+Эта история началась с вдохновения Lego Mindstorms и ASP.NET, а закончилась микробенчмарканьем пустых функций и поисками наиболее изощрённых использований дженериков. Если вам интересны рефлексия в C#, метапрограммирование, оптимизации кода и просто чужие страдания - добро пожаловать в статью.
 
-Поскольку заявленная тема касается только вызова функций, я опущу все подробности того, как роботогенератор находит нужные в какой-то момент времени функции и их аргументы, и сосредоточусь только на том, как эти функции, собственно, вызвать. Ещё одно упрощение – нас будут интересовать только методы без возвращаемого значения (void). Никаких принципиальных отличий при работе с возвращаемыми значениями в приведённых ниже схемах не будет.
+В один прекрасный день я приобрёл себе Lego Mindstorms. Всласть наигравшись с конструктором, я очень скоро разочаровался в его среде разработки и задался целью написать для него фреймворк для разработки на C#. Примерно в то же время я изучал ASP.NET Core, поэтому сильно вдохновлялся дизайном его контроллеров: логика робота описывается одним классом, методы которого – шаги одной итерации event loop'а робота, получающие в качестве аргументов значения сенсоров. Для реализации этого нужно научиться вызывать методы произвольной сигнатуры в рантайме, а с учётом того, что работает это всё на дохленьком ARM9 – это нужно делать *быстро*. Как говорили классики, "и заверте..."
+
+Чтобы этот текст был максимально простым и вместе с тем полезным, я постараюсь абстрагироваться от изначальной задачи. Так, я не буду описывать, как роботогенератор находит нужные в какой-то момент времени функции и их аргументы, и сосредоточусь только на том, как эти функции, собственно, вызвать. Ещё одно упрощение – нас будут интересовать только методы без возвращаемого значения (void). Никаких принципиальных отличий при работе с возвращаемыми значениями в приведённых ниже схемах не будет.
 
 ## Первое приближение
 
@@ -11,7 +13,7 @@
 ```C#
 var method = model.GetType().GetMethod(methodName,
                                        BindingFlags.Public | BindingFlags.Instance);
-method.Invoke(target, new [] { arg1, arg2 /*, ... */ };
+method.Invoke(target, new [] { arg1, arg2 /*, ... */ });
 ```
 
 Ищем среди публичных методов нужный нам `MethodInfo`, складываем необходимые ему аргументы (нам даже не нужно знать их тип) в массив объектов и вызываем. Коротко и понятно. Но работа с reflection – дело дорогое. А вот насколько дорогое? Чтобы не быть голословными, сделаем небольшой бенчмарк с помощью библиотеки [BenchmarkDotNet](https://benchmarkdotnet.org/):
@@ -56,7 +58,16 @@ public class FunctionCallBenchmark
                                               BindingFlags.Public | BindingFlags.Instance);
         if (method == null)
             throw new ArgumentNullException(methodName);
-        return () => method.Invoke(this, parameters.Select(p => p()).ToArray());
+
+        // Pre-create the arguments array to remove the allocation costs.
+        var gettersArray = parameters.ToArray();
+        var argsArray = new object[gettersArray.Length];
+        return () =>
+        {
+            for (int i = 0; i < argsArray.Length; ++i)
+                argsArray[i] = gettersArray[i]();
+            method.Invoke(this, argsArray);
+        };
     }
 
     // Regular calls:
@@ -79,27 +90,30 @@ public class FunctionCallBenchmark
 }
 ```
 
-Сравнивать будем обычные вызовы функций с количеством аргументов от 1 до 6 (почему столько – будет понятно чуть позднее) с этими же функциями, но скрытыми под делегатом `Action`, полученным из Reflection. Чтобы сэкономить время на выделение памяти под массив аргументов, создадим его один раз заранее, а потом просто будем заполнять. На практике доля сэкономленного времени варьировалась от 30% для одного аргумента до 10% для 6, но для краткости эти результаты я приводить не буду.
+Сравнивать будем обычные вызовы функций с количеством аргументов от 1 до 6 (почему столько – будет понятно чуть позднее) с этими же функциями, но скрытыми под делегатом `Action`, полученным из Reflection. Чтобы не замерять ненужное нам время на выделение памяти под массив аргументов, создадим его один раз заранее, а потом просто будем заполнять (на практике затраты на выделение массива варьировались от 30% для одного аргумента до 10% для 6 аргументов).
 
-Тестирование проводилось на MacBook Pro Mid 2014, Core i7-4870HQ. Запуск этого добра непосредственно на целевой платформе вылился в долгую и грустную историю, пока что остановившуюся на [багрепорте в Mono](https://github.com/mono/mono/issues/12537#issuecomment-554770577), так что ограничимся лишь академическим интересом. Результаты получились следующие:
-|                         Method |        Mean |      Error |     StdDev |      Median |
-|------------------------------- |------------:|-----------:|-----------:|------------:|
-|             RegularZeroArgCall |   0.0020 ns |  0.0058 ns |  0.0048 ns |   0.0000 ns |
-|              RegularOneArgCall |   0.0026 ns |  0.0068 ns |  0.0061 ns |   0.0000 ns |
-|              RegularTwoArgCall |   0.0189 ns |  0.0102 ns |  0.0090 ns |   0.0184 ns |
-|            RegularThreeArgCall |   0.0159 ns |  0.0042 ns |  0.0037 ns |   0.0166 ns |
-|             RegularFourArgCall |   0.0019 ns |  0.0033 ns |  0.0028 ns |   0.0000 ns |
-|             RegularFiveArgCall |   0.0012 ns |  0.0031 ns |  0.0026 ns |   0.0000 ns |
-|              RegularSixArgCall |   0.2742 ns |  0.0105 ns |  0.0088 ns |   0.2752 ns |
-|   ReflectionBasedZeroArgAction | 112.7083 ns |  0.7415 ns |  0.5789 ns | 112.7340 ns |
-|    ReflectionBasedOneArgAction | 192.6494 ns |  1.8164 ns |  1.6990 ns | 192.1628 ns |
-|    ReflectionBasedTwoArgAction | 258.7588 ns |  3.2811 ns |  3.0692 ns | 257.9058 ns |
-|  ReflectionBasedThreeArgAction | 322.0511 ns |  3.9985 ns |  3.5445 ns | 322.5660 ns |
-|   ReflectionBasedFourArgAction | 400.9057 ns |  3.4695 ns |  3.2454 ns | 400.1694 ns |
-|   ReflectionBasedFiveArgAction | 458.1926 ns |  3.4574 ns |  3.0649 ns | 457.5324 ns |
-|    ReflectionBasedSixArgAction | 549.6316 ns |  4.5302 ns |  3.7829 ns | 549.4001 ns |
+Тестирование проводилось на MacBook Pro M1 2020. Результатов с целевой платформы, увы, [пока не увидеть](https://github.com/mono/mono/issues/12537#issuecomment-554770577), так что ограничимся лишь академическим интересом. Результаты получились следующие:
 
-Вау! Как видно, на чистый вызов пустой функции тратится порядка сотой наносекунды; для 6 аргументов наблюдается стабильный прыжок до трети наносекунды, но что это – нехватка регистров или окончание кэш-линии – здесь я судить не берусь. А вот вызов функции через Reflection занимает аж на 4 порядка больше, да ещё и линейно растёт с количеством аргументов. С таким временем вызова (а мы ведь не только вызывать функции хотим) наш робот далеко не уедет.
+|                         Method |        Mean |     Error |    StdDev |      Median |
+|------------------------------- |------------:|----------:|----------:|------------:|
+|             RegularZeroArgCall |   0.0023 ns | 0.0035 ns | 0.0033 ns |   0.0000 ns |
+|              RegularOneArgCall |   0.0000 ns | 0.0000 ns | 0.0000 ns |   0.0000 ns |
+|              RegularTwoArgCall |   0.0168 ns | 0.0024 ns | 0.0022 ns |   0.0168 ns |
+|            RegularThreeArgCall |   0.0008 ns | 0.0014 ns | 0.0013 ns |   0.0000 ns |
+|             RegularFourArgCall |   0.0011 ns | 0.0019 ns | 0.0017 ns |   0.0000 ns |
+|             RegularFiveArgCall |   0.0037 ns | 0.0038 ns | 0.0032 ns |   0.0032 ns |
+|              RegularSixArgCall |   0.0022 ns | 0.0026 ns | 0.0022 ns |   0.0018 ns |
+|   ReflectionBasedZeroArgAction |  64.9950 ns | 0.5477 ns | 0.5123 ns |  65.2141 ns |
+|    ReflectionBasedOneArgAction | 139.0408 ns | 0.3873 ns | 0.3433 ns | 138.9701 ns |
+|    ReflectionBasedTwoArgAction | 201.3532 ns | 0.6453 ns | 0.5389 ns | 201.2620 ns |
+|  ReflectionBasedThreeArgAction | 261.2793 ns | 0.8609 ns | 0.7632 ns | 261.1321 ns |
+|   ReflectionBasedFourArgAction | 316.6166 ns | 1.2285 ns | 1.1492 ns | 316.6238 ns |
+|   ReflectionBasedFiveArgAction | 380.0440 ns | 2.4919 ns | 2.3310 ns | 379.7985 ns |
+|    ReflectionBasedSixArgAction | 448.8128 ns | 1.6282 ns | 1.5230 ns | 448.9000 ns |
+
+Вау! Как видно, на чистый вызов пустой функции тратится порядка сотой наносекунды. А вот вызов функции через Reflection занимает аж на 4 порядка больше, да ещё и линейно растёт с количеством аргументов. С таким временем вызова (а мы ведь не только вызывать функции хотим) наш робот далеко не уедет.
+
+*Ремарка: первые тесты я проводил на MacBook Pro Mid 2014 (Core i7-4870HQ) и .NET Core 3.1, и для чистого вызова функции от 6 аргументов наблюдается стабильный прыжок времени до трети наносекунды. Но что это – нехватка регистров или окончание кэш-линии – так и остаётся для меня загадкой.*
 
 ## Git the princess
 
@@ -195,33 +209,33 @@ public static Action ExtractAction(object target, MethodInfo method, Func<object
 Ну да хватит, скажете вы, каких-то хтонических конструкций нагородили, а ради чего? Где тесты, Билли?
 
 Вот:
-|                         Method |        Mean |      Error |     StdDev |      Median |
-|------------------------------- |------------:|-----------:|-----------:|------------:|
-|             RegularZeroArgCall |   0.0020 ns |  0.0058 ns |  0.0048 ns |   0.0000 ns |
-|              RegularOneArgCall |   0.0026 ns |  0.0068 ns |  0.0061 ns |   0.0000 ns |
-|              RegularTwoArgCall |   0.0189 ns |  0.0102 ns |  0.0090 ns |   0.0184 ns |
-|            RegularThreeArgCall |   0.0159 ns |  0.0042 ns |  0.0037 ns |   0.0166 ns |
-|             RegularFourArgCall |   0.0019 ns |  0.0033 ns |  0.0028 ns |   0.0000 ns |
-|             RegularFiveArgCall |   0.0012 ns |  0.0031 ns |  0.0026 ns |   0.0000 ns |
-|              RegularSixArgCall |   0.2742 ns |  0.0105 ns |  0.0088 ns |   0.2752 ns |
-|   ReflectionBasedZeroArgAction | 112.7083 ns |  0.7415 ns |  0.5789 ns | 112.7340 ns |
-|    ReflectionBasedOneArgAction | 192.6494 ns |  1.8164 ns |  1.6990 ns | 192.1628 ns |
-|    ReflectionBasedTwoArgAction | 258.7588 ns |  3.2811 ns |  3.0692 ns | 257.9058 ns |
-|  ReflectionBasedThreeArgAction | 322.0511 ns |  3.9985 ns |  3.5445 ns | 322.5660 ns |
-|   ReflectionBasedFourArgAction | 400.9057 ns |  3.4695 ns |  3.2454 ns | 400.1694 ns |
-|   ReflectionBasedFiveArgAction | 458.1926 ns |  3.4574 ns |  3.0649 ns | 457.5324 ns |
-|    ReflectionBasedSixArgAction | 549.6316 ns |  4.5302 ns |  3.7829 ns | 549.4001 ns |
-|      GenericBasedZeroArgAction |   1.6626 ns |  0.0132 ns |  0.0110 ns |   1.6637 ns |
-|       GenericBasedOneArgAction |   9.7318 ns |  0.1797 ns |  0.1593 ns |   9.6726 ns |
-|       GenericBasedTwoArgAction |  17.6455 ns |  0.1385 ns |  0.1228 ns |  17.6031 ns |
-|     GenericBasedThreeArgAction |  23.1999 ns |  0.3934 ns |  0.3680 ns |  23.0874 ns |
-|      GenericBasedFourArgAction |  32.1915 ns |  0.2011 ns |  0.1783 ns |  32.2297 ns |
-|      GenericBasedFiveArgAction |  39.1221 ns |  0.5112 ns |  0.4269 ns |  38.9700 ns |
-|       GenericBasedSixArgAction | 657.2011 ns |  5.5504 ns |  4.9202 ns | 655.3558 ns |
+|                         Method |        Mean |     Error |    StdDev |      Median |
+|------------------------------- |------------:|----------:|----------:|------------:|
+|             RegularZeroArgCall |   0.0023 ns | 0.0035 ns | 0.0033 ns |   0.0000 ns |
+|              RegularOneArgCall |   0.0000 ns | 0.0000 ns | 0.0000 ns |   0.0000 ns |
+|              RegularTwoArgCall |   0.0168 ns | 0.0024 ns | 0.0022 ns |   0.0168 ns |
+|            RegularThreeArgCall |   0.0008 ns | 0.0014 ns | 0.0013 ns |   0.0000 ns |
+|             RegularFourArgCall |   0.0011 ns | 0.0019 ns | 0.0017 ns |   0.0000 ns |
+|             RegularFiveArgCall |   0.0037 ns | 0.0038 ns | 0.0032 ns |   0.0032 ns |
+|              RegularSixArgCall |   0.0022 ns | 0.0026 ns | 0.0022 ns |   0.0018 ns |
+|   ReflectionBasedZeroArgAction |  64.9950 ns | 0.5477 ns | 0.5123 ns |  65.2141 ns |
+|    ReflectionBasedOneArgAction | 139.0408 ns | 0.3873 ns | 0.3433 ns | 138.9701 ns |
+|    ReflectionBasedTwoArgAction | 201.3532 ns | 0.6453 ns | 0.5389 ns | 201.2620 ns |
+|  ReflectionBasedThreeArgAction | 261.2793 ns | 0.8609 ns | 0.7632 ns | 261.1321 ns |
+|   ReflectionBasedFourArgAction | 316.6166 ns | 1.2285 ns | 1.1492 ns | 316.6238 ns |
+|   ReflectionBasedFiveArgAction | 380.0440 ns | 2.4919 ns | 2.3310 ns | 379.7985 ns |
+|    ReflectionBasedSixArgAction | 448.8128 ns | 1.6282 ns | 1.5230 ns | 448.9000 ns |
+|      GenericBasedZeroArgAction |   1.6060 ns | 0.0036 ns | 0.0028 ns |   1.6070 ns |
+|       GenericBasedOneArgAction |   6.5625 ns | 0.0123 ns | 0.0115 ns |   6.5623 ns |
+|       GenericBasedTwoArgAction |  10.8101 ns | 0.0373 ns | 0.0331 ns |  10.8021 ns |
+|     GenericBasedThreeArgAction |  14.6319 ns | 0.0544 ns | 0.0425 ns |  14.6250 ns |
+|      GenericBasedFourArgAction |  19.3778 ns | 0.0706 ns | 0.0551 ns |  19.3872 ns |
+|      GenericBasedFiveArgAction |  21.6174 ns | 0.0812 ns | 0.0720 ns |  21.6054 ns |
+|       GenericBasedSixArgAction | 509.3339 ns | 1.5230 ns | 1.3501 ns | 509.4516 ns |
 
 *Здесь я уже опущу модификации бенчмарка, в конце поста будет ссылка на полный бенчмарк на GitHub.*
 
-Неплохо! Для "вытянутых из болота" методов мы получили прирост на порядок в худшем случае, и аж на два порядка – в лучшем! Но как только мы выходим за пределы оптимизированного числа аргументов, мы сразу тонем в трясине, что неприятно.
+Неплохо! Для "вытянутых из болота" методов мы получили прирост в 20 раз в худшем случае, и в 40 – в лучшем! Но как только мы выходим за пределы оптимизированного числа аргументов, мы сразу тонем в трясине, что неприятно.
 
 В комментариях к посту Скита был предложен ещё один интересный способ: с помощью `System.Linq.Expressions`. В этом способе нам нужно руками собрать лямбда-выражение, которое будет вызывать нужный нам метод. Выглядеть это будет следующим образом:
 
@@ -247,22 +261,22 @@ private static TLambda CreateAction<TLambda>(object target, MethodInfo method)
 
 Посмотрим, на что способны эти `Expression`:
 
-|                         Method |        Mean |      Error |     StdDev |      Median |
-|------------------------------- |------------:|-----------:|-----------:|------------:|
-|      GenericBasedZeroArgAction |   1.6626 ns |  0.0132 ns |  0.0110 ns |   1.6637 ns |
-|       GenericBasedOneArgAction |   9.7318 ns |  0.1797 ns |  0.1593 ns |   9.6726 ns |
-|       GenericBasedTwoArgAction |  17.6455 ns |  0.1385 ns |  0.1228 ns |  17.6031 ns |
-|     GenericBasedThreeArgAction |  23.1999 ns |  0.3934 ns |  0.3680 ns |  23.0874 ns |
-|      GenericBasedFourArgAction |  32.1915 ns |  0.2011 ns |  0.1783 ns |  32.2297 ns |
-|      GenericBasedFiveArgAction |  39.1221 ns |  0.5112 ns |  0.4269 ns |  38.9700 ns |
-|       GenericBasedSixArgAction | 657.2011 ns |  5.5504 ns |  4.9202 ns | 655.3558 ns |
-|   ExpressionBasedZeroArgAction |   2.0401 ns |  0.0432 ns |  0.0404 ns |   2.0329 ns |
-|    ExpressionBasedOneArgAction |   9.4030 ns |  0.1680 ns |  0.1403 ns |   9.3999 ns |
-|    ExpressionBasedTwoArgAction |  16.3554 ns |  0.2737 ns |  0.2286 ns |  16.3293 ns |
-|  ExpressionBasedThreeArgAction |  23.5963 ns |  0.2666 ns |  0.2364 ns |  23.5592 ns |
-|   ExpressionBasedFourArgAction |  32.1926 ns |  0.6026 ns |  0.8044 ns |  32.2249 ns |
-|   ExpressionBasedFiveArgAction |  34.2504 ns |  0.2791 ns |  0.2475 ns |  34.1452 ns |
-|    ExpressionBasedSixArgAction | 659.5997 ns |  4.7805 ns |  4.2378 ns | 658.8155 ns |
+|                         Method |        Mean |     Error |    StdDev |      Median |
+|------------------------------- |------------:|----------:|----------:|------------:|
+|      GenericBasedZeroArgAction |   1.6060 ns | 0.0036 ns | 0.0028 ns |   1.6070 ns |
+|       GenericBasedOneArgAction |   6.5625 ns | 0.0123 ns | 0.0115 ns |   6.5623 ns |
+|       GenericBasedTwoArgAction |  10.8101 ns | 0.0373 ns | 0.0331 ns |  10.8021 ns |
+|     GenericBasedThreeArgAction |  14.6319 ns | 0.0544 ns | 0.0425 ns |  14.6250 ns |
+|      GenericBasedFourArgAction |  19.3778 ns | 0.0706 ns | 0.0551 ns |  19.3872 ns |
+|      GenericBasedFiveArgAction |  21.6174 ns | 0.0812 ns | 0.0720 ns |  21.6054 ns |
+|       GenericBasedSixArgAction | 509.3339 ns | 1.5230 ns | 1.3501 ns | 509.4516 ns |
+|   ExpressionBasedZeroArgAction |   1.7778 ns | 0.0033 ns | 0.0029 ns |   1.7771 ns |
+|    ExpressionBasedOneArgAction |   6.4550 ns | 0.0073 ns | 0.0065 ns |   6.4532 ns |
+|    ExpressionBasedTwoArgAction |  10.8472 ns | 0.0514 ns | 0.0481 ns |  10.8501 ns |
+|  ExpressionBasedThreeArgAction |  14.4573 ns | 0.1306 ns | 0.1222 ns |  14.4215 ns |
+|   ExpressionBasedFourArgAction |  18.7730 ns | 0.0617 ns | 0.0578 ns |  18.7706 ns |
+|   ExpressionBasedFiveArgAction |  19.8925 ns | 0.0604 ns | 0.0565 ns |  19.8935 ns |
+|    ExpressionBasedSixArgAction | 507.2038 ns | 1.3393 ns | 1.2527 ns | 507.4734 ns |
 
 Результаты практически идентичны.
 
@@ -342,26 +356,26 @@ public static Action ExtractAction(object target, MethodInfo method, Delegate[] 
 Что ж, выглядеть оно стало чуть приятнее. Кроме того, мы вынесли все приведения типов на уровень генерации `Action`, избежав во время вызова как проверок, так и боксинга. Должно же это было сказаться на скорости?
 
 Должно:
-|                         Method |        Mean |      Error |     StdDev |      Median |
-|------------------------------- |------------:|-----------:|-----------:|------------:|
-|      GenericBasedZeroArgAction |   1.6626 ns |  0.0132 ns |  0.0110 ns |   1.6637 ns |
-|       GenericBasedOneArgAction |   9.7318 ns |  0.1797 ns |  0.1593 ns |   9.6726 ns |
-|       GenericBasedTwoArgAction |  17.6455 ns |  0.1385 ns |  0.1228 ns |  17.6031 ns |
-|     GenericBasedThreeArgAction |  23.1999 ns |  0.3934 ns |  0.3680 ns |  23.0874 ns |
-|      GenericBasedFourArgAction |  32.1915 ns |  0.2011 ns |  0.1783 ns |  32.2297 ns |
-|      GenericBasedFiveArgAction |  39.1221 ns |  0.5112 ns |  0.4269 ns |  38.9700 ns |
-|       GenericBasedSixArgAction | 657.2011 ns |  5.5504 ns |  4.9202 ns | 655.3558 ns |
-|            StrictZeroArgAction |   0.8455 ns |  0.0071 ns |  0.0063 ns |   0.8450 ns |
-|             StrictOneArgAction |   3.6826 ns |  0.0478 ns |  0.0447 ns |   3.6674 ns |
-|             StrictTwoArgAction |   5.5219 ns |  0.0446 ns |  0.0395 ns |   5.5149 ns |
-|           StrictThreeArgAction |   7.3941 ns |  0.0434 ns |  0.0363 ns |   7.3792 ns |
-|            StrictFourArgAction |   8.4877 ns |  0.0455 ns |  0.0403 ns |   8.4674 ns |
-|            StrictFiveArgAction |  10.0094 ns |  0.1404 ns |  0.1313 ns |   9.9487 ns |
-|             StrictSixArgAction | 706.1372 ns | 13.6295 ns | 12.7490 ns | 702.4068 ns |
+|                         Method |        Mean |     Error |    StdDev |      Median |
+|------------------------------- |------------:|----------:|----------:|------------:|
+|      GenericBasedZeroArgAction |   1.6060 ns | 0.0036 ns | 0.0028 ns |   1.6070 ns |
+|       GenericBasedOneArgAction |   6.5625 ns | 0.0123 ns | 0.0115 ns |   6.5623 ns |
+|       GenericBasedTwoArgAction |  10.8101 ns | 0.0373 ns | 0.0331 ns |  10.8021 ns |
+|     GenericBasedThreeArgAction |  14.6319 ns | 0.0544 ns | 0.0425 ns |  14.6250 ns |
+|      GenericBasedFourArgAction |  19.3778 ns | 0.0706 ns | 0.0551 ns |  19.3872 ns |
+|      GenericBasedFiveArgAction |  21.6174 ns | 0.0812 ns | 0.0720 ns |  21.6054 ns |
+|       GenericBasedSixArgAction | 509.3339 ns | 1.5230 ns | 1.3501 ns | 509.4516 ns |
+|            StrictZeroArgAction |   0.6344 ns | 0.0026 ns | 0.0023 ns |   0.6340 ns |
+|             StrictOneArgAction |   2.3428 ns | 0.0051 ns | 0.0045 ns |   2.3411 ns |
+|             StrictTwoArgAction |   3.1607 ns | 0.0046 ns | 0.0036 ns |   3.1617 ns |
+|           StrictThreeArgAction |   4.1434 ns | 0.0046 ns | 0.0039 ns |   4.1432 ns |
+|            StrictFourArgAction |   5.0828 ns | 0.0078 ns | 0.0069 ns |   5.0818 ns |
+|            StrictFiveArgAction |   6.3591 ns | 0.0119 ns | 0.0093 ns |   6.3592 ns |
+|             StrictSixArgAction | 515.0386 ns | 1.3343 ns | 1.2481 ns | 514.7397 ns |
 
 *Здесь наше последнее решение названо Strict\*, т.к. мы не производим никаких преобразований и боксингов во время вызова функции.*
 
-Порядок мы, конечно, не сэкономили, но всё равно – четырёхкратное ускорение! Мы всё ещё видим линейный рост от количества аргументов, но, по всей видимости, тут он уже связан с получением аргументов с помощью делегатов.
+Порядок мы, конечно, не сэкономили, но всё равно – трёхкратное ускорение! Мы всё ещё видим линейный рост от количества аргументов, но, по всей видимости, тут он уже связан с получением аргументов с помощью делегатов (которые как минимум в одной из версий .NET делали virtcall для проверки таргет-объекта на `null`).
 
 А что же `Expression`?
 
@@ -391,40 +405,40 @@ public static Action ExtractAction(object target, MethodInfo method, Delegate[] 
 
 И при всей лаконичности этого кода у него есть один недостаток: он *медленней*, чем strict-вариант на дженериках:
 
-|                         Method |        Mean |      Error |     StdDev |      Median |
-|------------------------------- |------------:|-----------:|-----------:|------------:|
-|   ExpressionBasedZeroArgAction |   2.0401 ns |  0.0432 ns |  0.0404 ns |   2.0329 ns |
-|    ExpressionBasedOneArgAction |   9.4030 ns |  0.1680 ns |  0.1403 ns |   9.3999 ns |
-|    ExpressionBasedTwoArgAction |  16.3554 ns |  0.2737 ns |  0.2286 ns |  16.3293 ns |
-|  ExpressionBasedThreeArgAction |  23.5963 ns |  0.2666 ns |  0.2364 ns |  23.5592 ns |
-|   ExpressionBasedFourArgAction |  32.1926 ns |  0.6026 ns |  0.8044 ns |  32.2249 ns |
-|   ExpressionBasedFiveArgAction |  34.2504 ns |  0.2791 ns |  0.2475 ns |  34.1452 ns |
-|    ExpressionBasedSixArgAction | 659.5997 ns |  4.7805 ns |  4.2378 ns | 658.8155 ns |
-|            StrictZeroArgAction |   0.8455 ns |  0.0071 ns |  0.0063 ns |   0.8450 ns |
-|             StrictOneArgAction |   3.6826 ns |  0.0478 ns |  0.0447 ns |   3.6674 ns |
-|             StrictTwoArgAction |   5.5219 ns |  0.0446 ns |  0.0395 ns |   5.5149 ns |
-|           StrictThreeArgAction |   7.3941 ns |  0.0434 ns |  0.0363 ns |   7.3792 ns |
-|            StrictFourArgAction |   8.4877 ns |  0.0455 ns |  0.0403 ns |   8.4674 ns |
-|            StrictFiveArgAction |  10.0094 ns |  0.1404 ns |  0.1313 ns |   9.9487 ns |
-|             StrictSixArgAction | 706.1372 ns | 13.6295 ns | 12.7490 ns | 702.4068 ns |
-|  ExpressionStrictZeroArgAction |   1.3880 ns |  0.0182 ns |  0.0152 ns |   1.3865 ns |
-|   ExpressionStrictOneArgAction |   7.0025 ns |  0.1681 ns |  0.2411 ns |   6.8861 ns |
-|   ExpressionStrictTwoArgAction |  10.9824 ns |  0.0870 ns |  0.0772 ns |  10.9667 ns |
-| ExpressionStrictThreeArgAction |  16.8135 ns |  0.0993 ns |  0.0830 ns |  16.8004 ns |
-|  ExpressionStrictFourArgAction |  21.0620 ns |  0.4489 ns |  0.6293 ns |  21.3380 ns |
-|  ExpressionStrictFiveArgAction |  26.0780 ns |  0.1807 ns |  0.1602 ns |  26.0514 ns |
-|   ExpressionStrictSixArgAction |  31.6301 ns |  0.1896 ns |  0.1680 ns |  31.6275 ns |
+|                         Method |        Mean |     Error |    StdDev |      Median |
+|------------------------------- |------------:|----------:|----------:|------------:|
+|   ExpressionBasedZeroArgAction |   1.7778 ns | 0.0033 ns | 0.0029 ns |   1.7771 ns |
+|    ExpressionBasedOneArgAction |   6.4550 ns | 0.0073 ns | 0.0065 ns |   6.4532 ns |
+|    ExpressionBasedTwoArgAction |  10.8472 ns | 0.0514 ns | 0.0481 ns |  10.8501 ns |
+|  ExpressionBasedThreeArgAction |  14.4573 ns | 0.1306 ns | 0.1222 ns |  14.4215 ns |
+|   ExpressionBasedFourArgAction |  18.7730 ns | 0.0617 ns | 0.0578 ns |  18.7706 ns |
+|   ExpressionBasedFiveArgAction |  19.8925 ns | 0.0604 ns | 0.0565 ns |  19.8935 ns |
+|    ExpressionBasedSixArgAction | 507.2038 ns | 1.3393 ns | 1.2527 ns | 507.4734 ns |
+|            StrictZeroArgAction |   0.6344 ns | 0.0026 ns | 0.0023 ns |   0.6340 ns |
+|             StrictOneArgAction |   2.3428 ns | 0.0051 ns | 0.0045 ns |   2.3411 ns |
+|             StrictTwoArgAction |   3.1607 ns | 0.0046 ns | 0.0036 ns |   3.1617 ns |
+|           StrictThreeArgAction |   4.1434 ns | 0.0046 ns | 0.0039 ns |   4.1432 ns |
+|            StrictFourArgAction |   5.0828 ns | 0.0078 ns | 0.0069 ns |   5.0818 ns |
+|            StrictFiveArgAction |   6.3591 ns | 0.0119 ns | 0.0093 ns |   6.3592 ns |
+|             StrictSixArgAction | 515.0386 ns | 1.3343 ns | 1.2481 ns | 514.7397 ns |
+|  ExpressionStrictZeroArgAction |   0.9610 ns | 0.0015 ns | 0.0012 ns |   0.9608 ns |
+|   ExpressionStrictOneArgAction |   3.1721 ns | 0.0031 ns | 0.0025 ns |   3.1716 ns |
+|   ExpressionStrictTwoArgAction |   5.2637 ns | 0.0068 ns | 0.0064 ns |   5.2608 ns |
+| ExpressionStrictThreeArgAction |   7.5400 ns | 0.0085 ns | 0.0076 ns |   7.5382 ns |
+|  ExpressionStrictFourArgAction |   9.8659 ns | 0.0105 ns | 0.0093 ns |   9.8632 ns |
+|  ExpressionStrictFiveArgAction |  12.1958 ns | 0.0396 ns | 0.0351 ns |  12.1858 ns |
+|   ExpressionStrictSixArgAction |  14.2210 ns | 0.0159 ns | 0.0141 ns |  14.2150 ns |
 
-Но всё равно быстрее вариантов с приведениями типов.
+По абсолютам кажется, что не так уж и сильно - счёт идёт уже на наносекунды. Но на деле это полтора-два раза. Зато неоспоримо быстрее, чем вариант с приведениями типов.
 
 Почему так? Ответ кроется где-то в реализации компиляции деревьев выражений. Разбор этого, пожалуй, тема для отдельной статьи.
 
 Зато в последних результатах тестирования виден один важный нюанс: строгая реализация на деревьях выражений работает не только для тех количеств аргументов, которые мы ~~накопипастили~~ сумели обработать, а вообще для методов с произвольным количеством аргументов. Поэтому для самого-самого скоростного решения мы можем использовать strict-вариант с generics для разумно небольшого числа аргументов, а для всех остальных – на основе деревьев выражений.
 
-На этом мои изыскания закончились. Ниже приведён график времени вызова функции от количества аргументов для всех изложенных в статье способов (за исключением чистого reflection-based и функции от 6 аргументов – из-за огромной разницы в порядках отличия других значений трудно было бы отличить).
+В общем-то, на этом всё. Ниже приведён график времени вызова функции от количества аргументов для всех изложенных в статье способов (за исключением чистого reflection-based и функции от 6 аргументов – из-за огромной разницы в порядках отличия других значений трудно было бы отличить).
 
 ![plot](img/plot.png)
 
-Репозиторий с кодом бенчмарка можно найти [в моём профиле GitHub](https://github.com/alex-ks/cs-function-call-benchmark). Почти боевое применение этих наработок можно найти [в репозитории моего фреймворка для Lego Mindstorms](https://github.com/alex-ks/ev3dev_csharp). К сожалению, процесс его разработки оказался застопорен одним багом в Mono. Попытки воскресить проект пока не прекращаются и, возможно, их результат выльется в ещё одну статью.
+Репозиторий с кодом бенчмарка можно найти [в моём профиле GitHub](https://github.com/alex-ks/cs-function-call-benchmark). Почти боевое применение этих наработок можно найти [в репозитории моего фреймворка для Lego Mindstorms](https://github.com/alex-ks/ev3dev_csharp), но злая ирония в том, что способов запустить их в текущем виде на armel я так и не нашёл. Зато это сподвигло меня повторить эти упражнения на Java/Kotlin - и там есть про что написать ещё одну статью ;)
 
-Спасибо за уделённое время! Если есть какие-либо идеи или ответы на загадки со скачками времени--пишите в комментариях!
+Спасибо за уделённое время!
