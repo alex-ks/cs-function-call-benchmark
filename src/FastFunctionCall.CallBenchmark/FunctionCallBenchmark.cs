@@ -140,6 +140,7 @@ namespace FastFunctionCall.CallBenchmark
                                                   BindingFlags.Public | BindingFlags.Instance);
             if (method == null)
                 throw new ArgumentNullException(methodName);
+            // Pre-create the arguments array to remove the allocation costs.
             var gettersArray = parameters.ToArray();
             var argsArray = new object[gettersArray.Length];
             return () =>

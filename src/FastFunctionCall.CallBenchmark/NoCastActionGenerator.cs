@@ -23,27 +23,15 @@ public static class NoCastActionGenerator
         // Let the magic begin!
         if (parameters.Length == 0)
             return CreateStrictActionZeroArg(target, method);
-        string creatorName = null;
-        switch (parameters.Length)
+        string creatorName = (parameters.Length) switch
         {
-            case 1:
-                creatorName = nameof(CreateStrictAction1ArgGeneric);
-                break;
-            case 2:
-                creatorName = nameof(CreateStrictAction2ArgsGeneric);
-                break;
-            case 3:
-                creatorName = nameof(CreateStrictAction3ArgsGeneric);
-                break;
-            case 4:
-                creatorName = nameof(CreateStrictAction4ArgsGeneric);
-                break;
-            case 5:
-                creatorName = nameof(CreateStrictAction5ArgsGeneric);
-                break;
-            default:
-                throw new ArgumentException("Method must have less than 5 parameters.");
-        }
+            1 => nameof(CreateStrictAction1ArgGeneric),
+            2 => nameof(CreateStrictAction2ArgsGeneric),
+            3 => nameof(CreateStrictAction3ArgsGeneric),
+            4 => nameof(CreateStrictAction4ArgsGeneric),
+            5 => nameof(CreateStrictAction5ArgsGeneric),
+            _ => throw new ArgumentException("Method must have less than 5 parameters.")
+        };
         var genericCreator =
                 typeof(NoCastActionGenerator).GetMethod(creatorName, BindingFlags.Static | BindingFlags.NonPublic);
         var typeParameters = parameters.Select(p => p.ParameterType).ToArray();
